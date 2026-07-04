@@ -102,6 +102,25 @@ def project_enu_to_camera(de, dn, du, yaw_deg, pitch_deg=None):
     return right_m, vertical_m
 
 
+def projected_pair_displacement(enu, gps_data, idx, fallback_yaw, fallback_pitch, use_camera_projection):
+    de = enu[idx][0] - enu[idx - 1][0]
+    dn = enu[idx][1] - enu[idx - 1][1]
+    du = enu[idx][2] - enu[idx - 1][2]
+
+    if not use_camera_projection:
+        return de, dn
+
+    pair_yaw = circular_mean_deg([get_camera_yaw(gps_data[idx - 1]), get_camera_yaw(gps_data[idx])])
+    pair_pitch = mean_deg([gps_data[idx - 1].get("gimbal_pitch"), gps_data[idx].get("gimbal_pitch")])
+    return project_enu_to_camera(
+        de,
+        dn,
+        du,
+        fallback_yaw if pair_yaw is None else pair_yaw,
+        fallback_pitch if pair_pitch is None else pair_pitch,
+    )
+
+
 def mat_mul3x3(a, b):
     return a @ b
 
@@ -220,7 +239,16 @@ def extract_blade_mask(img, low_sat_percentile=12):
     return blade_mask, alpha, total_area / img_area
 
 
-def match_rotation(img1, img2, gps_dx, gps_dy, use_gps=True):
+def match_rotation(
+    img1,
+    img2,
+    gps_dx,
+    gps_dy,
+    use_gps=True,
+    visual_refine=True,
+    max_visual_shift=40.0,
+    visual_weight=0.35,
+):
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     orb = cv2.ORB_create(nfeatures=2500)
@@ -262,7 +290,15 @@ def match_rotation(img1, img2, gps_dx, gps_dy, use_gps=True):
 
     feat_dx = float(np.median(dxs))
     feat_dy = float(np.median(dys))
-    angles = [np.arctan2(dy - feat_dy, dx - feat_dx) for dx, dy in zip(dxs, dys)]
+    refined_dx = gps_dx
+    refined_dy = gps_dy
+    if visual_refine:
+        shift_x = np.clip(feat_dx - gps_dx, -max_visual_shift, max_visual_shift)
+        shift_y = np.clip(feat_dy - gps_dy, -max_visual_shift, max_visual_shift)
+        refined_dx = gps_dx + shift_x * visual_weight
+        refined_dy = gps_dy + shift_y * visual_weight
+
+    angles = [np.arctan2(dy - refined_dy, dx - refined_dx) for dx, dy in zip(dxs, dys)]
     theta = float(np.median(angles)) if angles else 0.0
     theta_deg = np.degrees(theta)
     if abs(theta_deg) > 15:
@@ -276,9 +312,9 @@ def match_rotation(img1, img2, gps_dx, gps_dy, use_gps=True):
     h[0, 1] = -sin_t
     h[1, 0] = sin_t
     h[1, 1] = cos_t
-    h[0, 2] = gps_dx
-    h[1, 2] = gps_dy
-    return h, f"rot={theta_deg:.1f}deg n={n_good}", feat_dx, feat_dy
+    h[0, 2] = refined_dx
+    h[1, 2] = refined_dy
+    return h, f"rot={theta_deg:.1f}deg n={n_good} gps=({gps_dx:.0f},{gps_dy:.0f}) vis=({feat_dx:.0f},{feat_dy:.0f})", feat_dx, feat_dy
 
 
 def warp_and_blend(canvas, new_img, h_mat):
@@ -474,7 +510,11 @@ def main():
     parser.add_argument("--blend-mode", choices=("direct", "average"), default="direct", help="Native output compositing mode")
     parser.add_argument("--gsd-mode", choices=("exif", "visual"), default="exif", help="Pixel scale source for GPS displacement")
     parser.add_argument("--gps-projection", choices=("camera", "enu"), default="camera", help="Project GPS displacement through DJI camera yaw/pitch or use raw ENU axes")
+    parser.add_argument("--gps-x-scale", type=float, default=1.0, help="Extra multiplier for projected GPS x displacement")
     parser.add_argument("--gps-y-sign", choices=("same", "invert"), default="invert", help="Map projected GPS forward/northing delta to image y with the same sign or inverted sign")
+    parser.add_argument("--no-visual-refine", action="store_true", help="Disable visual translation refinement and use GPS displacement directly")
+    parser.add_argument("--max-visual-shift", type=float, default=40.0, help="Maximum per-pair visual correction in scaled pixels")
+    parser.add_argument("--visual-weight", type=float, default=0.35, help="Blend weight for visual correction, from 0.0 to 1.0")
     parser.add_argument("--mask-percentile", type=float, default=12)
     parser.add_argument("--min-mask-ratio", type=float, default=0.02, help="Skip frames whose blade mask area ratio is below this value")
     parser.add_argument("--save-mask-preview", action="store_true")
@@ -573,16 +613,38 @@ def main():
     avg_focal = np.mean([g.get("focal_35mm", 70) for g in gps_data])
     exif_gsd = estimate_gsd(avg_alt, avg_focal) / scale_factor
 
+    yaw_values = [get_camera_yaw(g) for g in gps_data if get_camera_yaw(g) is not None]
+    pitch_values = [g.get("gimbal_pitch") for g in gps_data if g.get("gimbal_pitch") is not None]
+    fallback_yaw = circular_mean_deg(yaw_values)
+    fallback_pitch = mean_deg(pitch_values)
+    use_camera_projection = args.gps_projection == "camera" and fallback_yaw is not None
+    if use_camera_projection:
+        pitch_msg = f" pitch={fallback_pitch:.1f} deg" if fallback_pitch is not None else " pitch=none"
+        print(f"  GPS projection: camera yaw={fallback_yaw:.1f} deg{pitch_msg}")
+    else:
+        print("  GPS projection: raw ENU")
+
     if args.gsd_mode == "visual":
         print("Calibrating GPS pixel scale from visual matches...")
         gsd_samples = []
         for i in range(1, n):
             _, _, fd, fdy = match_rotation(images[i - 1], images[i], 0, 0, use_gps=False)
             if abs(fd) > 10 or abs(fdy) > 10:
-                gps_dist = np.hypot(enu[i][0] - enu[i - 1][0], enu[i][1] - enu[i - 1][1])
-                feat_dist = np.hypot(fd, fdy)
-                if gps_dist > 0.1 and feat_dist > 10:
-                    gsd_samples.append(gps_dist / feat_dist)
+                gps_dx, gps_dy = projected_pair_displacement(
+                    enu,
+                    gps_data,
+                    i,
+                    fallback_yaw,
+                    fallback_pitch,
+                    use_camera_projection,
+                )
+                if abs(gps_dx) > 0.1 and abs(fd) > 10:
+                    gsd_samples.append(abs(gps_dx) / abs(fd))
+                else:
+                    gps_dist = np.hypot(gps_dx, gps_dy)
+                    feat_dist = np.hypot(fd, fdy)
+                    if gps_dist > 0.1 and feat_dist > 10:
+                        gsd_samples.append(gps_dist / feat_dist)
 
         if len(gsd_samples) >= 5:
             gsd = float(np.median(gsd_samples))
@@ -595,37 +657,19 @@ def main():
         print(f"  GSD EXIF/GPS: {gsd * 100:.2f} cm/scaled px")
 
     y_sign = 1.0 if args.gps_y_sign == "same" else -1.0
-    yaw_values = [get_camera_yaw(g) for g in gps_data if get_camera_yaw(g) is not None]
-    pitch_values = [g.get("gimbal_pitch") for g in gps_data if g.get("gimbal_pitch") is not None]
-    fallback_yaw = circular_mean_deg(yaw_values)
-    fallback_pitch = mean_deg(pitch_values)
-    use_camera_projection = args.gps_projection == "camera" and fallback_yaw is not None
-    if use_camera_projection:
-        pitch_msg = f" pitch={fallback_pitch:.1f} deg" if fallback_pitch is not None else " pitch=none"
-        print(f"  GPS projection: camera yaw={fallback_yaw:.1f} deg{pitch_msg}")
-    else:
-        print("  GPS projection: raw ENU")
 
     pixel_dx = []
     pixel_dy = []
     for i in range(1, n):
-        de = enu[i][0] - enu[i - 1][0]
-        dn = enu[i][1] - enu[i - 1][1]
-        du = enu[i][2] - enu[i - 1][2]
-        if not use_camera_projection:
-            dx_m = de
-            dy_m = dn
-        else:
-            pair_yaw = circular_mean_deg([get_camera_yaw(gps_data[i - 1]), get_camera_yaw(gps_data[i])])
-            pair_pitch = mean_deg([gps_data[i - 1].get("gimbal_pitch"), gps_data[i].get("gimbal_pitch")])
-            dx_m, dy_m = project_enu_to_camera(
-                de,
-                dn,
-                du,
-                fallback_yaw if pair_yaw is None else pair_yaw,
-                fallback_pitch if pair_pitch is None else pair_pitch,
-            )
-        pixel_dx.append(dx_m / gsd)
+        dx_m, dy_m = projected_pair_displacement(
+            enu,
+            gps_data,
+            i,
+            fallback_yaw,
+            fallback_pitch,
+            use_camera_projection,
+        )
+        pixel_dx.append(dx_m / gsd * args.gps_x_scale)
         pixel_dy.append(y_sign * dy_m / gsd)
     print(f"  Total GPS displacement: dx={np.sum(pixel_dx):.0f} dy={np.sum(pixel_dy):.0f} px")
 
@@ -644,7 +688,15 @@ def main():
         y_end = min(acc.shape[0], y_start + prev_h + margin * 2)
         roi = acc[y_start:y_end, x_start:]
 
-        h_mat, info, _, _ = match_rotation(roi, images[i], init_dx - x_start, init_dy - y_start)
+        h_mat, info, _, _ = match_rotation(
+            roi,
+            images[i],
+            init_dx - x_start,
+            init_dy - y_start,
+            visual_refine=not args.no_visual_refine,
+            max_visual_shift=args.max_visual_shift,
+            visual_weight=args.visual_weight,
+        )
         h_mat[0, 2] += x_start
         h_mat[1, 2] += y_start
 

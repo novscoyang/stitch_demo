@@ -27,6 +27,9 @@ python -m pip install -r requirements.txt
 
 ## 快速开始
 
+推荐使用：
+ python stitch_blade_panorama.py --input input --output outputs/stitched_input_direct_camera_pitch_x14_refined.png --full-frame --gps-x-scale 3.0
+
 使用默认相机姿态投影生成完整画面直贴图：
 
 ```powershell
@@ -68,7 +71,11 @@ python stitch_blade_panorama.py --input input --output outputs/preview.png --sca
 | `--blend-mode` | `direct` | 原始分辨率叶片合成模式，可选 `direct` 或 `average`。 |
 | `--gsd-mode` | `exif` | GPS 到像素比例来源，可选 `exif` 或 `visual`。 |
 | `--gps-projection` | `camera` | GPS 投影模式。`camera` 使用 yaw/pitch，`enu` 使用原始 ENU 轴。 |
+| `--gps-x-scale` | `1.0` | 额外放大或缩小投影后的 x 方向 GPS 位移。dx 方向太密时可调大。 |
 | `--gps-y-sign` | `invert` | GPS 投影到图像 y 方向时的符号。 |
+| `--no-visual-refine` | 关闭 | 禁用视觉平移微调，只使用 GPS 投影位移。 |
+| `--max-visual-shift` | `40` | 每对图片允许视觉算法修正的最大像素量，单位是缩放后的配准像素。 |
+| `--visual-weight` | `0.35` | 视觉修正权重。越大越相信视觉匹配，越小越相信 GPS。 |
 | `--mask-percentile` | `12` | 叶片低饱和度 mask 的百分位阈值。 |
 | `--min-mask-ratio` | `0.02` | 小于该 mask 面积比例的帧会被跳过。 |
 | `--save-mask-preview` | 关闭 | 在输出图片旁边保存叶片 mask 预览图。 |
@@ -82,7 +89,10 @@ python stitch_blade_panorama.py --input input --output outputs/preview.png --sca
 ## 调试建议
 
 - 如果拼接方向明显不对，先比较 `--gps-projection camera` 和 `--gps-projection enu`。
-- 如果 GPS 到像素比例偏差较大，可以尝试 `--gsd-mode visual`。
+- 如果 dx 方向太密，优先尝试 `--gps-x-scale 1.3` 到 `--gps-x-scale 1.5`。
+- 默认会在 GPS 初值基础上做保守视觉微调，用于减少局部错位；如果视觉匹配导致跳变，可加 `--no-visual-refine`。
+- 如果局部错位仍明显，可小幅增大 `--max-visual-shift` 或 `--visual-weight`，例如 `--max-visual-shift 60 --visual-weight 0.45`。
+- 如果 GPS 到像素比例整体偏差较大，可以尝试 `--gsd-mode visual`，但它可能会过度拉开 x 方向，需要结合预览判断。
 - 如果 y 方向整体翻转，可以尝试 `--gps-y-sign same`。
 - 如果只想检查位姿和全局排列，用 `--full-frame` 更直观。
 - 如果只关心叶片输出，不要加 `--full-frame`。
