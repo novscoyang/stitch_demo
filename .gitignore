@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+outputs/
+stitched_*
+debug_*
+*_masks.jpg
+smoke_*.png
+
+*.log
+out.txt
+input.tar
+
