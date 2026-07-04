@@ -28,7 +28,9 @@ python -m pip install -r requirements.txt
 ## 快速开始
 
 推荐使用：
+```powershell
  python stitch_blade_panorama.py --input input --output outputs/stitched_input_direct_camera_pitch_x14_refined.png --full-frame --gps-x-scale 3.0
+```
 
 使用默认相机姿态投影生成完整画面直贴图：
 
