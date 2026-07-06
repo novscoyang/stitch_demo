@@ -29,13 +29,19 @@ python -m pip install -r requirements.txt
 
 推荐使用：
 ```powershell
- python stitch_blade_panorama.py --input input --output outputs/stitched_input_direct_camera_pitch_x14_refined.png --full-frame --gps-x-scale 4.0
+ python stitch_blade_panorama.py --input input --output outputs/stitched_input_direct_camera_pitch_x14_refined.png --full-frame --gps-x-scale 8.0 --gps-y-scale 8.0 
 ```
 
 使用默认相机姿态投影生成完整画面直贴图：
 
 ```powershell
 python stitch_blade_panorama.py --input input --output outputs/stitched_input_direct_camera_pitch.png --full-frame
+```
+
+假设无人机走直线，只使用第一张和最后一张 GPS，并按图片顺序直接排布：
+
+```powershell
+python stitch_blade_panorama.py --input input --output outputs/linear_first_last_gps_only_full.png --full-frame --gps-path linear --placement gps --gps-x-scale 1.4
 ```
 
 只合成识别到的叶片区域：
@@ -70,10 +76,13 @@ python stitch_blade_panorama.py --input input --output outputs/preview.png --sca
 | `--scale` | `1500` | 配准时使用的缩放宽度。设为 `0` 表示用原始分辨率配准。 |
 | `--full-frame` | 关闭 | 贴入完整原始帧，而不是只合成叶片 mask 区域。 |
 | `--low-res-output` | 关闭 | 输出缩放后的配准图，而不是原始分辨率合成图。 |
+| `--placement` | `match` | 图片放置方式。`match` 使用视觉匹配，`gps` 直接按 GPS 位移排布。 |
 | `--blend-mode` | `direct` | 原始分辨率叶片合成模式，可选 `direct` 或 `average`。 |
 | `--gsd-mode` | `exif` | GPS 到像素比例来源，可选 `exif` 或 `visual`。 |
+| `--gps-path` | `actual` | GPS 路径来源。`actual` 使用逐帧 GPS，`linear` 使用首尾 GPS 直线插值。 |
 | `--gps-projection` | `camera` | GPS 投影模式。`camera` 使用 yaw/pitch，`enu` 使用原始 ENU 轴。 |
 | `--gps-x-scale` | `1.0` | 额外放大或缩小投影后的 x 方向 GPS 位移。dx 方向太密时可调大。 |
+| `--gps-y-scale` | `1.0` | 额外放大或缩小投影后的 y 方向 GPS 位移。dy 方向太密时可调大。 |
 | `--gps-y-sign` | `invert` | GPS 投影到图像 y 方向时的符号。 |
 | `--no-visual-refine` | 关闭 | 禁用视觉平移微调，只使用 GPS 投影位移。 |
 | `--max-visual-shift` | `40` | 每对图片允许视觉算法修正的最大像素量，单位是缩放后的配准像素。 |
@@ -92,11 +101,13 @@ python stitch_blade_panorama.py --input input --output outputs/preview.png --sca
 
 - 如果拼接方向明显不对，先比较 `--gps-projection camera` 和 `--gps-projection enu`。
 - 如果 dx 方向太密，优先尝试 `--gps-x-scale 1.3` 到 `--gps-x-scale 1.5`。
+- 如果 dy 方向太密，优先尝试 `--gps-y-scale 1.3` 到 `--gps-y-scale 1.5`。
 - 默认会在 GPS 初值基础上做保守视觉微调，用于减少局部错位；如果视觉匹配导致跳变，可加 `--no-visual-refine`。
 - 如果局部错位仍明显，可小幅增大 `--max-visual-shift` 或 `--visual-weight`，例如 `--max-visual-shift 60 --visual-weight 0.45`。
 - 如果 GPS 到像素比例整体偏差较大，可以尝试 `--gsd-mode visual`，但它可能会过度拉开 x 方向，需要结合预览判断。
 - 如果 y 方向整体翻转，可以尝试 `--gps-y-sign same`。
 - 如果只想检查位姿和全局排列，用 `--full-frame` 更直观。
+- 如果只想看“首尾 GPS 直线 + 图片顺序排布”的基线效果，用 `--gps-path linear --placement gps --full-frame`。
 - 如果只关心叶片输出，不要加 `--full-frame`。
 
 ## 注意事项
@@ -105,5 +116,3 @@ python stitch_blade_panorama.py --input input --output outputs/preview.png --sca
 - 脚本依赖照片中的 GPS 和 DJI 云台元数据；缺失元数据会影响自动投影效果。
 - 生成图、调试图、缓存和日志已在 `.gitignore` 中忽略。
 - 原始照片通常体积较大，是否纳入版本管理应根据实际项目需要决定。
-
-

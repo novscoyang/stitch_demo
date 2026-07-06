@@ -102,11 +102,7 @@ def project_enu_to_camera(de, dn, du, yaw_deg, pitch_deg=None):
     return right_m, vertical_m
 
 
-def projected_pair_displacement(enu, gps_data, idx, fallback_yaw, fallback_pitch, use_camera_projection):
-    de = enu[idx][0] - enu[idx - 1][0]
-    dn = enu[idx][1] - enu[idx - 1][1]
-    du = enu[idx][2] - enu[idx - 1][2]
-
+def project_displacement(de, dn, du, gps_data, idx, fallback_yaw, fallback_pitch, use_camera_projection):
     if not use_camera_projection:
         return de, dn
 
@@ -119,6 +115,13 @@ def projected_pair_displacement(enu, gps_data, idx, fallback_yaw, fallback_pitch
         fallback_yaw if pair_yaw is None else pair_yaw,
         fallback_pitch if pair_pitch is None else pair_pitch,
     )
+
+
+def projected_pair_displacement(enu, gps_data, idx, fallback_yaw, fallback_pitch, use_camera_projection):
+    de = enu[idx][0] - enu[idx - 1][0]
+    dn = enu[idx][1] - enu[idx - 1][1]
+    du = enu[idx][2] - enu[idx - 1][2]
+    return project_displacement(de, dn, du, gps_data, idx, fallback_yaw, fallback_pitch, use_camera_projection)
 
 
 def mat_mul3x3(a, b):
@@ -507,10 +510,13 @@ def main():
     parser.add_argument("--scale", type=int, default=1500, help="Native-width scale target, 0 keeps full resolution")
     parser.add_argument("--low-res-output", action="store_true", help="Composite the scaled registration images instead of the native originals")
     parser.add_argument("--full-frame", action="store_true", help="Paste whole native input frames by the estimated coordinates, without blade masks or blending")
+    parser.add_argument("--placement", choices=("match", "gps"), default="match", help="Use visual pair matching or place frames directly from GPS displacement")
     parser.add_argument("--blend-mode", choices=("direct", "average"), default="direct", help="Native output compositing mode")
     parser.add_argument("--gsd-mode", choices=("exif", "visual"), default="exif", help="Pixel scale source for GPS displacement")
+    parser.add_argument("--gps-path", choices=("actual", "linear"), default="actual", help="Use actual per-frame GPS or linearly interpolate between first and last GPS")
     parser.add_argument("--gps-projection", choices=("camera", "enu"), default="camera", help="Project GPS displacement through DJI camera yaw/pitch or use raw ENU axes")
     parser.add_argument("--gps-x-scale", type=float, default=1.0, help="Extra multiplier for projected GPS x displacement")
+    parser.add_argument("--gps-y-scale", type=float, default=1.0, help="Extra multiplier for projected GPS y displacement")
     parser.add_argument("--gps-y-sign", choices=("same", "invert"), default="invert", help="Map projected GPS forward/northing delta to image y with the same sign or inverted sign")
     parser.add_argument("--no-visual-refine", action="store_true", help="Disable visual translation refinement and use GPS displacement directly")
     parser.add_argument("--max-visual-shift", type=float, default=40.0, help="Maximum per-pair visual correction in scaled pixels")
@@ -660,17 +666,43 @@ def main():
 
     pixel_dx = []
     pixel_dy = []
-    for i in range(1, n):
-        dx_m, dy_m = projected_pair_displacement(
-            enu,
-            gps_data,
-            i,
-            fallback_yaw,
-            fallback_pitch,
-            use_camera_projection,
+    if args.gps_path == "linear":
+        first = gps_data[0]
+        last = gps_data[-1]
+        print(
+            "  GPS path: linear first-to-last "
+            f"{first['file']}({first['lat']:.7f},{first['lon']:.7f},{first['alt']:.2f}) -> "
+            f"{last['file']}({last['lat']:.7f},{last['lon']:.7f},{last['alt']:.2f})"
         )
+        step_de = (enu[-1][0] - enu[0][0]) / (n - 1)
+        step_dn = (enu[-1][1] - enu[0][1]) / (n - 1)
+        step_du = (enu[-1][2] - enu[0][2]) / (n - 1)
+    else:
+        print("  GPS path: actual per-frame GPS")
+
+    for i in range(1, n):
+        if args.gps_path == "linear":
+            dx_m, dy_m = project_displacement(
+                step_de,
+                step_dn,
+                step_du,
+                gps_data,
+                i,
+                fallback_yaw,
+                fallback_pitch,
+                use_camera_projection,
+            )
+        else:
+            dx_m, dy_m = projected_pair_displacement(
+                enu,
+                gps_data,
+                i,
+                fallback_yaw,
+                fallback_pitch,
+                use_camera_projection,
+            )
         pixel_dx.append(dx_m / gsd * args.gps_x_scale)
-        pixel_dy.append(y_sign * dy_m / gsd)
+        pixel_dy.append(y_sign * dy_m / gsd * args.gps_y_scale)
     print(f"  Total GPS displacement: dx={np.sum(pixel_dx):.0f} dy={np.sum(pixel_dy):.0f} px")
 
     print("Computing pair transforms...")
@@ -678,35 +710,61 @@ def main():
     acc = images[0].copy()
     crop_x = 0.0
     crop_y = 0.0
-    for i in range(1, n):
-        init_dx = sum(pixel_dx[:i]) - crop_x
-        init_dy = sum(pixel_dy[:i]) - crop_y
-        prev_h, prev_w = images[i - 1].shape[:2]
-        margin = 400
-        x_start = max(0, acc.shape[1] - prev_w - margin)
-        y_start = max(0, (acc.shape[0] - prev_h) // 2 - margin)
-        y_end = min(acc.shape[0], y_start + prev_h + margin * 2)
-        roi = acc[y_start:y_end, x_start:]
+    if args.placement == "gps":
+        print("  Placement: GPS direct, no visual matching")
+        positions = [(0.0, 0.0)]
+        for i in range(1, n):
+            positions.append((positions[-1][0] + pixel_dx[i - 1], positions[-1][1] + pixel_dy[i - 1]))
 
-        h_mat, info, _, _ = match_rotation(
-            roi,
-            images[i],
-            init_dx - x_start,
-            init_dy - y_start,
-            visual_refine=not args.no_visual_refine,
-            max_visual_shift=args.max_visual_shift,
-            visual_weight=args.visual_weight,
-        )
-        h_mat[0, 2] += x_start
-        h_mat[1, 2] += y_start
+        h_img, w_img = images[0].shape[:2]
+        xs = [p[0] for p in positions] + [p[0] + w_img for p in positions]
+        ys = [p[1] for p in positions] + [p[1] + h_img for p in positions]
+        xmin = float(np.floor(min(xs)))
+        ymin = float(np.floor(min(ys)))
+        xmax = float(np.ceil(max(xs)))
+        ymax = float(np.ceil(max(ys)))
+        acc = np.zeros((int(ymax - ymin), int(xmax - xmin), 3), dtype=np.uint8)
+        image_transforms = []
+        for i, (x_pos, y_pos) in enumerate(positions):
+            h_mat = np.eye(3, dtype=np.float64)
+            h_mat[0, 2] = x_pos - xmin
+            h_mat[1, 2] = y_pos - ymin
+            image_transforms.append(h_mat)
+            warped = cv2.warpPerspective(images[i], h_mat, (acc.shape[1], acc.shape[0]))
+            src_mask = np.ones(images[i].shape[:2], dtype=np.uint8) * 255
+            warped_mask = cv2.warpPerspective(src_mask, h_mat, (acc.shape[1], acc.shape[0]), flags=cv2.INTER_NEAREST)
+            acc[warped_mask > 0] = warped[warped_mask > 0]
+            print(f"  {i:02d}/{n - 1}: gps=({x_pos:.0f},{y_pos:.0f}) -> {acc.shape[1]}x{acc.shape[0]}")
+    else:
+        for i in range(1, n):
+            init_dx = sum(pixel_dx[:i]) - crop_x
+            init_dy = sum(pixel_dy[:i]) - crop_y
+            prev_h, prev_w = images[i - 1].shape[:2]
+            margin = 400
+            x_start = max(0, acc.shape[1] - prev_w - margin)
+            y_start = max(0, (acc.shape[0] - prev_h) // 2 - margin)
+            y_end = min(acc.shape[0], y_start + prev_h + margin * 2)
+            roi = acc[y_start:y_end, x_start:]
 
-        acc, cx, cy = warp_and_blend(acc, images[i], h_mat)
-        crop_t = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
-        image_transforms = [crop_t @ t for t in image_transforms]
-        image_transforms.append(crop_t @ h_mat)
-        crop_x += cx
-        crop_y += cy
-        print(f"  {i:02d}/{n - 1}: {info} -> {acc.shape[1]}x{acc.shape[0]}")
+            h_mat, info, _, _ = match_rotation(
+                roi,
+                images[i],
+                init_dx - x_start,
+                init_dy - y_start,
+                visual_refine=not args.no_visual_refine,
+                max_visual_shift=args.max_visual_shift,
+                visual_weight=args.visual_weight,
+            )
+            h_mat[0, 2] += x_start
+            h_mat[1, 2] += y_start
+
+            acc, cx, cy = warp_and_blend(acc, images[i], h_mat)
+            crop_t = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
+            image_transforms = [crop_t @ t for t in image_transforms]
+            image_transforms.append(crop_t @ h_mat)
+            crop_x += cx
+            crop_y += cy
+            print(f"  {i:02d}/{n - 1}: {info} -> {acc.shape[1]}x{acc.shape[0]}")
 
     print("Compositing masked blade pixels...")
     if args.low_res_output or abs(scale_factor - 1.0) < 1e-9:
